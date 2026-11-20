@@ -146,6 +146,21 @@ python inference/inference_bm25.py \
   --remove_repeat_docs
 ```
 
+To compare the original selector with the optional Provence selector, install its
+sentence splitter and add `--evidence_selector provence` to the BM25 command.
+Use a separate `--experiment_name`, `--output_path`, and `--log_path` because
+the inference script appends results to existing files.
+
+```bash
+python -m pip install nltk
+python -m nltk.downloader punkt_tab
+```
+
+Provence selects evidence from the current round's BM25 documents using the
+original question. Its output is mapped back to the source sentences, with at
+most six selected sentences per round. The default checkpoint is downloaded
+on first use. Pass `--provence_model /path/to/checkpoint` to use a local copy.
+
 ### E5 dense retrieval
 
 ```bash
