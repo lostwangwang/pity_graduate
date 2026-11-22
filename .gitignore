@@ -1,8 +1,8 @@
 /S2G-RAG/data/2WikiMultiHopQA/
 /S2G-RAG/data/hotpotqa_lora
 /S2G-RAG/data/original
-/S2G-RAG/logs
-/S2G-RAG/predictions
+# /S2G-RAG/logs
+# /S2G-RAG/predictions
 
 /S2G-RAG/bm25_search/corpus
 /S2G-RAG/bm25_search/datasets
@@ -13,10 +13,13 @@
 
 __pycache__/
 
-*.log
 *.txt
 *.nohup
 
 S2G-RAG/LoraCheckpoint/adapter_model.safetensors
 data.json
 reproduce/docs.md
+
+reproduce/logs/
+reproduce/predictions/
+S2G-RAG/predictions/triviaqa_bm25_full_predictions.csv

@@ -26,7 +26,16 @@ DATASET_RETRIEVAL_PROTOCOL = {
 
 
 def infer_dataset_name(dataset_name=None, input_path=None, experiment_name=None):
-    """Resolve the dataset name from an explicit argument or a known filename pattern."""
+    """
+    Resolve the dataset name from an explicit argument or a known filename pattern.
+    显式传入参数、文件路径或者实验名称自动识别数据集名称
+    Args:
+        dataset_name: The name of the dataset to resolve.
+        input_path: The path to the input file.
+        experiment_name: The name of the experiment.
+    Returns:
+        return: 标准化后的数据集名字
+    """
     if dataset_name:
         normalized = dataset_name.strip().lower()
         if normalized in SUPPORTED_DATASETS:

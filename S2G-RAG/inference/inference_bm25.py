@@ -368,6 +368,7 @@ def build_query_from_missing(question, missing_facts, max_facts=None, dataset_na
     if not missing_facts:
         return question
 
+    # 用来收集事实短语
     phrases = []
     # 只取前max_facts条缺失事实
     for item in missing_facts[:max_facts]:
@@ -391,7 +392,12 @@ def build_query_from_missing(question, missing_facts, max_facts=None, dataset_na
 
 
 def should_force_first_retrieval(turn, evidence_context, verdict):
-    """Force one retrieval when the first-turn gate is overconfident on empty evidence."""
+    """
+    强制首轮检索: 解决一个边界情况——第一轮证据为空，但gate模型误判证据充足
+    :param turn: 当前是第几轮
+    :param evidence_context: 目前累积拿到的证据上下文
+    :param verdict: gate的充足性
+    """
     return turn == 0 and bool(verdict) and not str(evidence_context or "").strip()
 
 
@@ -650,13 +656,22 @@ def save_results_to_csv(df: pd.DataFrame, filename: str):
 
 
 def _load_gold_answers(row):
-    """Support both 'Answer' and legacy 'Answers' columns."""
+    """
+    读取标准答案, 兼容两种别名: 新版"Answer" / 旧版"Answers
+    :param row: pandas的一行数据(DataFrame的一行)
+    :return: list格式的标准答案列表
+    """
+    # 如果这一行存在旧列名, "Answers", 优先读取它
     if "Answers" in row.index:
+        # safe_literal_eval: 安全地解析字符串为Python对象(比如列表、字典)
         return safe_literal_eval(row["Answers"])
+    # 如果这一行存在新列名, "Answer", 读取它
     if "Answer" in row.index:
         value = row["Answer"]
+        # 解析为列表, 如果已经是列表则直接返回
         parsed = safe_literal_eval(value)
         return parsed if isinstance(parsed, list) else [value]
+    # 如果两种都没找到, 返回空列表
     return []
 
 
@@ -1060,15 +1075,23 @@ def parse_args():
 
 
 def load_corpus_and_searcher(dataset_name):
-    """Load corpus, retriever settings, and initialize the searcher."""
+    """
+    加载语料库、检索参数，初始化BM25检索器
+    """
+    # 根据数据集名字，拿到corpus(语料)和index配置文件的路径
     corpus_path, settings_path = get_bm25_resource_paths(dataset_name)
 
+    # 读取预先保存好的完整语料(pickle序列化文件)
     with open(corpus_path, "rb") as f:
         loaded_corpus = pickle.load(f)
+    
+    # 读取BM25索引的配置信息(k1, b, 索引文件夹路径等)
     with open(settings_path, "rb") as f:
         settings = pickle.load(f)
 
+    # 从保存好的索引目录加载BM25检索器(pyserini的SimpleSearcher类)
     searcher_obj = SimpleSearcher(settings["index_dir"])
+    # 设置BM25超参数 k1, b: 如果配置里没有，默认k1=0.9, b=0.4
     searcher_obj.set_bm25(settings.get("k1", 0.9), settings.get("b", 0.4))
     return loaded_corpus, searcher_obj
 
