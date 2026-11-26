@@ -43,6 +43,12 @@ from utils.e5_utils import (
     build_kirag_style_document,
     safe_model_tag,
 )
+from utils.provence_selector import (
+    PROVENCE_MODEL,
+    load_provence,
+    recover_history_evidence,
+    select_provence_sentence_ids,
+)
 
 try:
     import pysbd
@@ -608,6 +614,42 @@ def format_missing_facts_for_selector(missing_facts, max_facts=3) -> str:
 
     return "\n".join(lines) if lines else "None."
 
+def build_evidence_fact_queries(questions, missing_facts_batch, gpt=False):
+    """Turn the original question and judge gaps into self-contained evidence queries."""
+    tasks = [
+        f"Question: {question}\nJudge gaps:\n{format_missing_facts_for_selector(gaps)}"
+        for question, gaps in zip(questions, missing_facts_batch, strict=True)
+    ]
+    outputs = call_reasoner_batch(
+        system_prefixes=(
+            "Identify the distinct factual requirements that source sentences could "
+            "support for this question. Include both sides of explicit comparisons, "
+            "even when the judge lists only one side. Prioritize unresolved gaps, use "
+            "only entities and constraints supplied in the input, and do not guess "
+            "missing entities or values. Return up to six short, self-contained "
+            'retrieval questions as JSON: {"fact_queries": ["..."]}.'
+        ),
+        task_contents=tasks,
+        gpt=gpt,
+        temperature=0.0,
+        top_p=1.0,
+        max_new_tokens=256,
+        do_sample=False,
+    )
+    queries_batch = []
+    for question, output in zip(questions, outputs, strict=True):
+        parsed = safe_json_load(output)
+        facts = parsed.get("fact_queries") if isinstance(parsed, dict) else None
+        queries = {}
+        if isinstance(facts, list):
+            for fact in facts:
+                if isinstance(fact, str) and fact.strip():
+                    fact = " ".join(fact.split())
+                    queries.setdefault(fact.casefold(), fact)
+        queries_batch.append(list(queries.values())[:6] or [question])
+    return queries_batch
+
+
 def concat_and_pick_sentences_batch(
     questions,
     titles_batch,
@@ -792,6 +834,9 @@ def main_batch(
     remove_repeat_docs,
     batch_questions=None,
     write_csv=True,
+    evidence_selector="s2g",
+    provence=None,
+    history_repair_top_k=0,
 ):
     """Run one batched multi-turn RAG loop."""
     if batch_questions is None:
@@ -803,6 +848,7 @@ def main_batch(
     all_past_doc_ids = [[] for _ in task_contents]
     evidence_context_so_far = [""] * len(task_contents)
     raw_retrieved_concat_so_far = [""] * len(task_contents)
+    history_docs = [[] for _ in task_contents] if history_repair_top_k else None
 
     while turn <= max_turns and task_contents:
         verdicts, missing_facts_list = call_suff_gate_batch(
@@ -816,6 +862,24 @@ def main_batch(
             if should_force_first_retrieval(turn, evidence_context_so_far[i], verdict):
                 verdicts[i] = False
                 missing_facts_list[i] = []
+
+        if history_docs is not None and 0 < turn < max_turns:
+            recovered = recover_history_evidence(
+                provence, batch_questions, verdicts, missing_facts_list, history_docs,
+                evidence_context_so_far, split_wiki_sentences, budget=history_repair_top_k,
+            )
+            if recovered:
+                repair_indices = [i for i, _, _ in recovered]
+                for i, query, evidence in recovered:
+                    evidence_context_so_far[i] = append_evidence_context(evidence_context_so_far[i], evidence)
+                    task_contents[i] = update_task_with_evidence(task_contents[i], f"[History repair] {query}", evidence)
+                repaired_verdicts, repaired_gaps = call_suff_gate_batch(
+                    [batch_questions[i] for i in repair_indices],
+                    [evidence_context_so_far[i] for i in repair_indices],
+                    gate_model, gate_tokenizer,
+                )
+                for i, verdict, gaps in zip(repair_indices, repaired_verdicts, repaired_gaps, strict=True):
+                    verdicts[i], missing_facts_list[i] = verdict, gaps
 
         done_idx = [i for i, verdict in enumerate(verdicts) if verdict or turn == max_turns]
         need_retrieve_idx = [i for i, verdict in enumerate(verdicts) if (not verdict) and turn < max_turns]
@@ -839,6 +903,8 @@ def main_batch(
             )
 
             for local_index, global_index in enumerate(need_retrieve_idx):
+                if history_docs is not None:
+                    history_docs[global_index].extend(zip(sub_titles[local_index], sub_texts[local_index]))
                 for doc_id, title in zip(sub_doc_ids[local_index], sub_titles[local_index]):
                     if doc_id and doc_id != "No results found." and doc_id not in all_past_doc_ids[global_index]:
                         all_past_doc_ids[global_index].append(doc_id)
@@ -853,16 +919,34 @@ def main_batch(
                 else:
                     raw_retrieved_concat_so_far[global_index] = new_raw
 
-            sub_evidence_ids = concat_and_pick_sentences_batch(
-                questions=[batch_questions[i] for i in need_retrieve_idx],
-                titles_batch=sub_titles,
-                texts_batch=sub_texts,
-                missing_facts_batch=[missing_facts_list[i] for i in need_retrieve_idx],
-                dataset_name=dataset_name,
-                gpt=gpt,
-                return_top_k=6,
-                max_sents_per_doc=40,
-            )
+            retrieval_questions = [batch_questions[i] for i in need_retrieve_idx]
+            retrieval_gaps = [missing_facts_list[i] for i in need_retrieve_idx]
+            if evidence_selector == "s2g":
+                sub_evidence_ids = concat_and_pick_sentences_batch(
+                    questions=retrieval_questions,
+                    titles_batch=sub_titles,
+                    texts_batch=sub_texts,
+                    missing_facts_batch=retrieval_gaps,
+                    dataset_name=dataset_name,
+                    gpt=gpt,
+                    return_top_k=6,
+                    max_sents_per_doc=40,
+                )
+            else:
+                queries = (
+                    [[question] for question in retrieval_questions]
+                    if evidence_selector == "provence"
+                    else build_evidence_fact_queries(retrieval_questions, retrieval_gaps, gpt)
+                )
+                sub_evidence_ids = select_provence_sentence_ids(
+                    provence,
+                    queries,
+                    sub_texts,
+                    split_wiki_sentences,
+                    return_top_k=6,
+                    max_sents_per_doc=40,
+                    reserve_per_fact=evidence_selector == "provence_grouped",
+                )
 
             for local_index, global_index in enumerate(need_retrieve_idx):
                 merged = merge_evidence_only(
@@ -946,6 +1030,8 @@ def main_batch(
         all_past_doc_ids = [all_past_doc_ids[i] for i in need_retrieve_idx]
         evidence_context_so_far = [evidence_context_so_far[i] for i in need_retrieve_idx]
         raw_retrieved_concat_so_far = [raw_retrieved_concat_so_far[i] for i in need_retrieve_idx]
+        if history_docs is not None:
+            history_docs = [history_docs[i] for i in need_retrieve_idx]
         turn += 1
 
     if write_csv and checkpoint_file:
@@ -966,6 +1052,9 @@ def run_system(
     remove_repeat_docs=False,
     start_index=0,
     end_index=5000,
+    evidence_selector="s2g",
+    provence=None,
+    history_repair_top_k=0,
 ):
     """Run the end-to-end evaluation loop."""
     data = pd.read_csv(input_file)
@@ -1007,6 +1096,9 @@ def run_system(
             remove_repeat_docs=remove_repeat_docs,
             batch_questions=batch_questions,
             write_csv=False,
+            evidence_selector=evidence_selector,
+            provence=provence,
+            history_repair_top_k=history_repair_top_k,
         )
 
         if batch_results:
@@ -1063,7 +1155,24 @@ def parse_args():
     parser.add_argument("--gpt", action="store_true", default=False)
     parser.add_argument("--top_docs", type=int, default=6)
     parser.add_argument("--remove_repeat_docs", action="store_true", default=False)
-    return parser.parse_args()
+    parser.add_argument(
+        "--evidence_selector",
+        choices=["s2g", "provence", "provence_pooled", "provence_grouped"],
+        default="s2g",
+        help="Select original S2G, question-only Provence, or pooled/grouped fact queries.",
+    )
+    parser.add_argument("--provence_model", default=PROVENCE_MODEL)
+    parser.add_argument(
+        "--history_repair", action="store_true",
+        help="Use Provence to recover missing evidence from earlier retrieval turns.",
+    )
+    parser.add_argument("--history_repair_top_k", type=int, default=3)
+    args = parser.parse_args()
+    if args.history_repair and args.evidence_selector != "s2g":
+        parser.error("--history_repair requires --evidence_selector s2g")
+    if args.history_repair and args.history_repair_top_k < 1:
+        parser.error("--history_repair_top_k must be positive")
+    return args
 
 def load_corpus(dataset_name):
     """Load the retrieval corpus."""
@@ -1170,6 +1279,10 @@ def main():
     init_e5_retriever(corpus_obj=corpus, cache_dir=e5_cache_dir, corpus_tag=corpus_tag)
 
     tokenizer, model, gate_tokenizer, gate_model = load_reasoner_and_gate(args)
+    provence = None
+    if args.evidence_selector != "s2g" or args.history_repair:
+        provence = load_provence(args.provence_model, accelerator.device)
+    print(f"[INFO] Evidence selector: {args.evidence_selector}", flush=True)
 
     run_system(
         input_file=args.input_path,
@@ -1184,6 +1297,9 @@ def main():
         remove_repeat_docs=args.remove_repeat_docs,
         start_index=args.start_index,
         end_index=args.end_index,
+        evidence_selector=args.evidence_selector,
+        provence=provence,
+        history_repair_top_k=args.history_repair_top_k if args.history_repair else 0,
     )
 
 if __name__ == "__main__":

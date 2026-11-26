@@ -25,6 +25,7 @@ from utils.text_processing import (
     safe_literal_eval,
 )
 from utils.corpus_selection import get_bm25_resource_paths, infer_dataset_name
+from utils.provence_selector import PROVENCE_MODEL, load_provence, recover_history_evidence
 
 try:
     import pysbd
@@ -38,9 +39,6 @@ except Exception:
 
 _CJK_RE = re.compile(r"[\u4e00-\u9fff]")
 _JSON_RE = re.compile(r"\{.*\}", re.S)
-PROVENCE_MODEL = "naver/provence-reranker-debertav3-v1"
-PROVENCE_REVISION = "ef49e233e3c6e50efc476c68f1390f8a63add4d4"
-
 CSV_COLUMNS = [
     "ID",
     "Turn",
@@ -697,6 +695,7 @@ def main_batch(
     batch_questions=None,
     write_csv=True,
     provence=None,
+    history_repair_top_k=0,
 ):
     """
     Run one batched multi-turn RAG loop.
@@ -730,6 +729,7 @@ def main_batch(
     all_past_doc_ids = [[] for _ in task_contents] # 每个样本: 历史已经检索过的文档ID, 去重用
     evidence_context_so_far = [""] * len(task_contents) # 每个样本: 经过筛选后的证据上下文(送入reasoner的精简上下文)
     raw_retrieved_concat_so_far = [""] * len(task_contents) # 每个样本: 原始检索文档全文拼接(留作日志，不直接喂给模型)
+    history_docs = [[] for _ in task_contents] if history_repair_top_k else None
 
     while turn <= max_turns and task_contents: # 循环执行，直到信息充足或达到最大轮次
         # ====== Step 1: 调用sufficiency gate批量判断信息是否充足 ======
@@ -747,6 +747,24 @@ def main_batch(
             if should_force_first_retrieval(turn, evidence_context_so_far[i], verdict):
                 verdicts[i] = False
                 missing_facts_list[i] = []
+
+        if history_docs is not None and 0 < turn < max_turns:
+            recovered = recover_history_evidence(
+                provence, batch_questions, verdicts, missing_facts_list, history_docs,
+                evidence_context_so_far, split_wiki_sentences, budget=history_repair_top_k,
+            )
+            if recovered:
+                repair_indices = [i for i, _, _ in recovered]
+                for i, query, evidence in recovered:
+                    evidence_context_so_far[i] = append_evidence_context(evidence_context_so_far[i], evidence)
+                    task_contents[i] = update_task_with_evidence(task_contents[i], f"[History repair] {query}", evidence)
+                repaired_verdicts, repaired_gaps = call_suff_gate_batch(
+                    [batch_questions[i] for i in repair_indices],
+                    [evidence_context_so_far[i] for i in repair_indices],
+                    gate_model, gate_tokenizer,
+                )
+                for i, verdict, gaps in zip(repair_indices, repaired_verdicts, repaired_gaps, strict=True):
+                    verdicts[i], missing_facts_list[i] = verdict, gaps
 
         # 划分两类样本
         # done_idx: 本轮可以停止检索，生成答案的样本(Gate说信息足够了 / 已经耗尽了max_turns最大轮次)
@@ -778,6 +796,8 @@ def main_batch(
 
             # 把本轮新检索到的文档，追加到该样本的历史记录里(去重)
             for local_index, global_index in enumerate(need_retrieve_idx):
+                if history_docs is not None:
+                    history_docs[global_index].extend(zip(sub_titles[local_index], sub_texts[local_index]))
                 for doc_id, title in zip(sub_doc_ids[local_index], sub_titles[local_index]):
                     if doc_id and doc_id != "No results found." and doc_id not in all_past_doc_ids[global_index]:
                         all_past_doc_ids[global_index].append(doc_id)
@@ -796,7 +816,7 @@ def main_batch(
             retrieval_questions = [batch_questions[i] for i in need_retrieve_idx]
             # ====== Step 3: 证据筛选 ======
             # 如果没传provence，则用concat_and_pick_sentences_batch做句子筛选
-            if provence is None:
+            if provence is None or history_repair_top_k:
                 # 用concat_and_pick_sentences_batch做句子筛选
                 sub_evidence_ids = concat_and_pick_sentences_batch(
                     questions=retrieval_questions,
@@ -910,6 +930,8 @@ def main_batch(
         all_past_doc_ids = [all_past_doc_ids[i] for i in need_retrieve_idx]
         evidence_context_so_far = [evidence_context_so_far[i] for i in need_retrieve_idx]
         raw_retrieved_concat_so_far = [raw_retrieved_concat_so_far[i] for i in need_retrieve_idx]
+        if history_docs is not None:
+            history_docs = [history_docs[i] for i in need_retrieve_idx]
         turn += 1
 
     # 可选: 本轮结果写入csv
@@ -933,6 +955,7 @@ def run_system(
     start_index=0,
     end_index=5000,
     provence=None,
+    history_repair_top_k=0,
 ):
     """
     Run the end-to-end evaluation loop.
@@ -1005,6 +1028,7 @@ def run_system(
             batch_questions=batch_questions,
             write_csv=False, # 不在main_batch内部写文件，最后统一写入output_file
             provence=provence,
+            history_repair_top_k=history_repair_top_k,
         )
 
         if batch_results: # 如果batch_results非空，则写入output_file
@@ -1071,7 +1095,17 @@ def parse_args():
         "--provence_model", default=PROVENCE_MODEL,
         help="Provence Hugging Face model ID or path to a local checkpoint.",
     )
-    return parser.parse_args()
+    parser.add_argument(
+        "--history_repair", action="store_true",
+        help="Use Provence to recover missing evidence from earlier retrieval turns.",
+    )
+    parser.add_argument("--history_repair_top_k", type=int, default=3)
+    args = parser.parse_args()
+    if args.history_repair and args.evidence_selector != "s2g":
+        parser.error("--history_repair requires --evidence_selector s2g")
+    if args.history_repair and args.history_repair_top_k < 1:
+        parser.error("--history_repair_top_k must be positive")
+    return args
 
 
 def load_corpus_and_searcher(dataset_name):
@@ -1220,19 +1254,8 @@ def main():
 
     # 证据抽取器
     provence = None
-    # 如果参数指定evidence_selector为provence, 则加载这个句子级筛选模型
-    if args.evidence_selector == "provence":
-        from transformers import AutoModel
-
-        # 版本控制: 指定provence模型的revision版本号
-        revision = PROVENCE_REVISION if args.provence_model == PROVENCE_MODEL else None
-        # 加载Provence预训练模型，放到当前设备上，设置为eval推理模式
-        provence = AutoModel.from_pretrained(
-            args.provence_model,
-            revision=revision,
-            trust_remote_code=True,
-            torch_dtype=torch.float32,
-        ).to(accelerator.device).eval()
+    if args.evidence_selector == "provence" or args.history_repair:
+        provence = load_provence(args.provence_model, accelerator.device)
 
     # 正式启动S2G-RAG主推理循环
     run_system(
@@ -1249,6 +1272,7 @@ def main():
         start_index=args.start_index, # 从哪一行开始跑数据
         end_index=args.end_index, # 到哪一行结束
         provence=provence,
+        history_repair_top_k=args.history_repair_top_k if args.history_repair else 0,
     )
 
 
