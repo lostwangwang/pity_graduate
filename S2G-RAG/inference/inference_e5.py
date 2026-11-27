@@ -837,6 +837,7 @@ def main_batch(
     evidence_selector="s2g",
     provence=None,
     history_repair_top_k=0,
+    history_repair_use_gap=True,
 ):
     """Run one batched multi-turn RAG loop."""
     if batch_questions is None:
@@ -867,6 +868,7 @@ def main_batch(
             recovered = recover_history_evidence(
                 provence, batch_questions, verdicts, missing_facts_list, history_docs,
                 evidence_context_so_far, split_wiki_sentences, budget=history_repair_top_k,
+                use_gap=history_repair_use_gap,
             )
             if recovered:
                 repair_indices = [i for i, _, _ in recovered]
@@ -1055,6 +1057,7 @@ def run_system(
     evidence_selector="s2g",
     provence=None,
     history_repair_top_k=0,
+    history_repair_use_gap=True,
 ):
     """Run the end-to-end evaluation loop."""
     data = pd.read_csv(input_file)
@@ -1099,6 +1102,7 @@ def run_system(
             evidence_selector=evidence_selector,
             provence=provence,
             history_repair_top_k=history_repair_top_k,
+            history_repair_use_gap=history_repair_use_gap,
         )
 
         if batch_results:
@@ -1167,6 +1171,10 @@ def parse_args():
         help="Use Provence to recover missing evidence from earlier retrieval turns.",
     )
     parser.add_argument("--history_repair_top_k", type=int, default=3)
+    parser.add_argument(
+        "--history_repair_query", choices=["question", "question_gap"], default="question_gap",
+        help="Choose which query Provence sees during history repair.",
+    )
     args = parser.parse_args()
     if args.history_repair and args.evidence_selector != "s2g":
         parser.error("--history_repair requires --evidence_selector s2g")
@@ -1300,6 +1308,7 @@ def main():
         evidence_selector=args.evidence_selector,
         provence=provence,
         history_repair_top_k=args.history_repair_top_k if args.history_repair else 0,
+        history_repair_use_gap=args.history_repair_query == "question_gap",
     )
 
 if __name__ == "__main__":

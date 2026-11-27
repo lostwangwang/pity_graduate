@@ -159,6 +159,7 @@ def _history_candidates(history, context, split_sentences):
 
 def recover_history_evidence(
     provence, questions, verdicts, gaps, histories, contexts, split_sentences, *, budget,
+    use_gap=True,
 ):
     """Return (batch index, query, evidence block) for successful historical lookups."""
     lookups = []
@@ -176,7 +177,7 @@ def recover_history_evidence(
         return []
     selected = _select_from_sentences(
         provence,
-        [[query] for _, query, _ in lookups],
+        [[query if use_gap else questions[index]] for index, query, _ in lookups],
         [[sentences for _, sentences in candidates] for _, _, candidates in lookups],
         budget,
     )
