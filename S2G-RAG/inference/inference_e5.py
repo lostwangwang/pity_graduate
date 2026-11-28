@@ -4,6 +4,7 @@ import os
 import pickle
 import re
 import sys
+from functools import partial
 
 import numpy as np
 import pandas as pd
@@ -838,6 +839,9 @@ def main_batch(
     provence=None,
     history_repair_top_k=0,
     history_repair_use_gap=True,
+    history_repair_verify=False,
+    history_repair_verify_mode="sentence",
+    history_repair_candidate_top_k=None,
 ):
     """Run one batched multi-turn RAG loop."""
     if batch_questions is None:
@@ -850,6 +854,7 @@ def main_batch(
     evidence_context_so_far = [""] * len(task_contents)
     raw_retrieved_concat_so_far = [""] * len(task_contents)
     history_docs = [[] for _ in task_contents] if history_repair_top_k else None
+    history_verifier = partial(call_reasoner_batch, gpt=gpt) if history_repair_verify else None
 
     while turn <= max_turns and task_contents:
         verdicts, missing_facts_list = call_suff_gate_batch(
@@ -868,7 +873,10 @@ def main_batch(
             recovered = recover_history_evidence(
                 provence, batch_questions, verdicts, missing_facts_list, history_docs,
                 evidence_context_so_far, split_wiki_sentences, budget=history_repair_top_k,
+                candidate_budget=history_repair_candidate_top_k,
                 use_gap=history_repair_use_gap,
+                verifier=history_verifier,
+                verification_mode=history_repair_verify_mode,
             )
             if recovered:
                 repair_indices = [i for i, _, _ in recovered]
@@ -1058,6 +1066,9 @@ def run_system(
     provence=None,
     history_repair_top_k=0,
     history_repair_use_gap=True,
+    history_repair_verify=False,
+    history_repair_verify_mode="sentence",
+    history_repair_candidate_top_k=None,
 ):
     """Run the end-to-end evaluation loop."""
     data = pd.read_csv(input_file)
@@ -1102,7 +1113,10 @@ def run_system(
             evidence_selector=evidence_selector,
             provence=provence,
             history_repair_top_k=history_repair_top_k,
+            history_repair_candidate_top_k=history_repair_candidate_top_k,
             history_repair_use_gap=history_repair_use_gap,
+            history_repair_verify=history_repair_verify,
+            history_repair_verify_mode=history_repair_verify_mode,
         )
 
         if batch_results:
@@ -1170,16 +1184,40 @@ def parse_args():
         "--history_repair", action="store_true",
         help="Use Provence to recover missing evidence from earlier retrieval turns.",
     )
-    parser.add_argument("--history_repair_top_k", type=int, default=3)
+    parser.add_argument(
+        "--history_repair_top_k", type=int, default=3,
+        help="Maximum number of repaired sentences added to the context per round.",
+    )
+    parser.add_argument(
+        "--history_repair_candidate_top_k", type=int,
+        help="Maximum number of Provence candidates before verification. Defaults to the number of sentences added.",
+    )
     parser.add_argument(
         "--history_repair_query", choices=["question", "question_gap"], default="question_gap",
         help="Choose which query Provence sees during history repair.",
     )
+    parser.add_argument(
+        "--history_repair_verify", action="store_true",
+        help="Check Provence candidates against the gap with the existing reasoner before adding them.",
+    )
+    parser.add_argument(
+        "--history_repair_verify_mode", choices=["sentence", "joint"], default="sentence",
+        help="Choose sentence-level or evidence-chain instructions for the verifier.",
+    )
     args = parser.parse_args()
+    if args.history_repair_verify and not args.history_repair:
+        parser.error("--history_repair_verify requires --history_repair")
+    if args.history_repair_verify_mode == "joint" and not args.history_repair_verify:
+        parser.error("--history_repair_verify_mode joint requires --history_repair_verify")
     if args.history_repair and args.evidence_selector != "s2g":
         parser.error("--history_repair requires --evidence_selector s2g")
     if args.history_repair and args.history_repair_top_k < 1:
         parser.error("--history_repair_top_k must be positive")
+    if args.history_repair_candidate_top_k is not None:
+        if not args.history_repair:
+            parser.error("--history_repair_candidate_top_k requires --history_repair")
+        if args.history_repair_candidate_top_k < args.history_repair_top_k:
+            parser.error("--history_repair_candidate_top_k must be at least --history_repair_top_k")
     return args
 
 def load_corpus(dataset_name):
@@ -1308,7 +1346,10 @@ def main():
         evidence_selector=args.evidence_selector,
         provence=provence,
         history_repair_top_k=args.history_repair_top_k if args.history_repair else 0,
+        history_repair_candidate_top_k=args.history_repair_candidate_top_k,
         history_repair_use_gap=args.history_repair_query == "question_gap",
+        history_repair_verify=args.history_repair_verify,
+        history_repair_verify_mode=args.history_repair_verify_mode,
     )
 
 if __name__ == "__main__":

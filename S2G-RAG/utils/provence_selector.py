@@ -3,7 +3,9 @@
 import re
 import unicodedata
 from collections import Counter
-from itertools import zip_longest
+from itertools import groupby, zip_longest
+
+from utils.history_repair_filter import verify_history_candidates
 
 
 PROVENCE_MODEL = "naver/provence-reranker-debertav3-v1"
@@ -64,7 +66,7 @@ def _allocate_budget(ranked_groups, budget, reserve_per_fact):
         if len(selected) == budget:
             break
         selected.add(sentence)
-    return sorted(selected)
+    return [sentence for sentence in pooled if sentence in selected]
 
 
 def select_provence_sentence_ids(
@@ -87,6 +89,17 @@ def select_provence_sentence_ids(
 
 def _select_from_sentences(provence, queries_batch, sentences_batch, budget, reserve_per_fact=False):
     selected_batch = [[[] for _ in documents] for documents in sentences_batch]
+    ranked_batch = _rank_from_sentences(
+        provence, queries_batch, sentences_batch, budget, reserve_per_fact
+    )
+    for selected_docs, ranked in zip(selected_batch, ranked_batch, strict=True):
+        for doc_id, sentence_id in sorted(ranked):
+            selected_docs[doc_id].append(sentence_id)
+    return selected_batch
+
+
+def _rank_from_sentences(provence, queries_batch, sentences_batch, budget, reserve_per_fact=False):
+    """Return ranked (document ID, sentence ID) selections before formatting by source."""
     questions, contexts, owners = [], [], []
     for index, (queries, documents) in enumerate(zip(queries_batch, sentences_batch, strict=True)):
         context = [" ".join(sentences) for sentences in documents if sentences]
@@ -96,7 +109,7 @@ def _select_from_sentences(provence, queries_batch, sentences_batch, budget, res
                 contexts.append(context)
                 owners.append(index)
     if not questions:
-        return selected_batch
+        return [[] for _ in sentences_batch]
 
     pruned = provence.process(
         question=questions, context=contexts, title=None, reorder=False, batch_size=16
@@ -104,13 +117,10 @@ def _select_from_sentences(provence, queries_batch, sentences_batch, budget, res
     ranked_batch = [[] for _ in sentences_batch]
     for index, pruned_docs in zip(owners, pruned, strict=True):
         ranked_batch[index].append(_source_ids(sentences_batch[index], pruned_docs))
-    for selected_docs, ranked_groups in zip(selected_batch, ranked_batch, strict=True):
-        for doc_id, sentence_id in _allocate_budget(ranked_groups, budget, reserve_per_fact):
-            selected_docs[doc_id].append(sentence_id)
-    return selected_batch
+    return [_allocate_budget(groups, budget, reserve_per_fact) for groups in ranked_batch]
 
 
-def _history_query(question, gaps):
+def _history_gap_text(gaps):
     phrases = []
     for gap in gaps[:3]:
         if not isinstance(gap, dict):
@@ -120,10 +130,7 @@ def _history_query(question, gaps):
         )
         if words := " ".join(str(phrase).split()):
             phrases.append(words)
-    if phrases:
-        question = " ".join(question.split())
-        return f"{question} Missing information: {' '.join(phrases)}"
-    return ""
+    return " ".join(phrases)
 
 
 def _history_candidates(history, context, split_sentences):
@@ -159,34 +166,63 @@ def _history_candidates(history, context, split_sentences):
 
 def recover_history_evidence(
     provence, questions, verdicts, gaps, histories, contexts, split_sentences, *, budget,
-    use_gap=True,
+    candidate_budget=None, use_gap=True, verifier=None, verification_mode="sentence",
 ):
     """Return (batch index, query, evidence block) for successful historical lookups."""
     lookups = []
     for index, verdict in enumerate(verdicts):
         if verdict or not gaps[index] or not histories[index]:
             continue
-        query = _history_query(questions[index], gaps[index])
-        if not query:
+        gap_text = _history_gap_text(gaps[index])
+        if not gap_text:
             continue
         candidates = _history_candidates(histories[index], contexts[index], split_sentences)
         if candidates:
-            lookups.append((index, query, candidates))
+            question = " ".join(questions[index].split())
+            query = f"{question} Missing information: {gap_text}"
+            lookups.append((index, query, gap_text, candidates))
 
     if not lookups:
         return []
-    selected = _select_from_sentences(
+    ranked_batch = _rank_from_sentences(
         provence,
-        [[query if use_gap else questions[index]] for index, query, _ in lookups],
-        [[sentences for _, sentences in candidates] for _, _, candidates in lookups],
-        budget,
+        [[query if use_gap else questions[index]] for index, query, _, _ in lookups],
+        [[sentences for _, sentences in candidates] for _, _, _, candidates in lookups],
+        budget if candidate_budget is None else candidate_budget,
     )
+    proposals = [(lookup, ranked) for lookup, ranked in zip(lookups, ranked_batch, strict=True) if ranked]
+
+    decisions = [None] * len(proposals)
+    if verifier is not None and proposals:
+        decisions = verify_history_candidates(verifier, [
+            (questions[index], gap_text, contexts[index], _verifier_candidates(candidates, ranked))
+            for (index, _, gap_text, candidates), ranked in proposals
+        ], mode=verification_mode)
+
     recovered = []
-    for (index, query, candidates), selections in zip(lookups, selected, strict=True):
-        blocks = []
-        for (title, sentences), ids in zip(candidates, selections, strict=True):
-            if ids:
-                blocks.append(f"[{title}] EVIDENCE:\n- " + "\n- ".join(sentences[i - 1] for i in ids))
-        if blocks:
-            recovered.append((index, query, "\n\n---\n\n".join(blocks)))
+    for ((index, query, _, candidates), ranked), decision in zip(proposals, decisions, strict=True):
+        accepted = _accepted_history_ids(ranked, decision, budget)
+        evidence = []
+        for doc_id, locations in groupby(accepted, key=lambda item: item[0]):
+            title, sentences = candidates[doc_id]
+            evidence.append(f"[{title}] EVIDENCE:\n- " + "\n- ".join(
+                sentences[sentence_id - 1] for _, sentence_id in locations
+            ))
+        if evidence:
+            recovered.append((index, query, "\n\n---\n\n".join(evidence)))
     return recovered
+
+
+def _verifier_candidates(documents, ranked):
+    return [
+        (documents[doc_id][0], documents[doc_id][1][sentence_id - 1])
+        for doc_id, sentence_id in sorted(ranked)
+    ]
+
+
+def _accepted_history_ids(ranked, decision, budget):
+    """Apply the final cap in Provence order and format the chosen IDs in source order."""
+    if decision is None:
+        return sorted(ranked[:budget])
+    accepted = {location for number, location in enumerate(sorted(ranked), 1) if number in decision}
+    return sorted([location for location in ranked if location in accepted][:budget])
