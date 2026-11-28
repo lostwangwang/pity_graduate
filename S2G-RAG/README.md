@@ -161,6 +161,37 @@ original question. Its output is mapped back to the source sentences, with at
 most six selected sentences per round. The default checkpoint is downloaded
 on first use. Pass `--provence_model /path/to/checkpoint` to use a local copy.
 
+### Module 1 · AdaGATE historical evidence repair
+
+Add these flags to either the BM25 or E5 inference command.
+
+```bash
+--history_repair --history_repair_backend adagate \
+  --history_repair_top_k 3 --history_repair_token_budget 160
+```
+
+S2G selects evidence from newly retrieved documents. When the Judge finds
+the selected evidence insufficient, the repair step ranks unseen sentences
+from all documents already retrieved for that question. It scores gap
+coverage, question relevance, novelty, and redundancy against the current
+evidence. If the Judge supplies no usable gap, the score uses the original
+question and current evidence. The largest drop in utility determines the
+adaptive candidate cutoff, with a two-candidate buffer. The sentence cap
+and the Judge-tokenizer budget limit each repair addition, including
+source titles and separators.
+
+After adding evidence, S2G asks the Judge again. A sufficient verdict skips
+the next retrieval. If the Judge still needs evidence and retrieval turns
+remain, S2G uses the updated gaps for the next search. Repair can also run
+after the last retrieval, before answer generation.
+
+This sentence-level adaptation uses selected evidence as a proxy for the
+AdaGATE entity ledger. It does not use confidence-based corroboration,
+replace existing evidence, or load Provence. Add `--history_repair_verify
+--history_repair_verify_mode joint` to verify candidate evidence chains with
+the existing reasoner before adding them. Use `--history_repair_backend
+provence` for the original history-repair backend.
+
 ### E5 dense retrieval
 
 ```bash

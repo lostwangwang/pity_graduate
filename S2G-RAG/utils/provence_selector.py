@@ -5,6 +5,7 @@ import unicodedata
 from collections import Counter
 from itertools import groupby, zip_longest
 
+from utils.adagate_history import rank_history_sentences
 from utils.history_repair_filter import verify_history_candidates
 
 
@@ -133,7 +134,7 @@ def _history_gap_text(gaps):
     return " ".join(phrases)
 
 
-def _history_candidates(history, context, split_sentences):
+def _history_candidates(history, context, split_sentences, sentence_limit=40):
     """Keep source sentences that have not already been exposed to the Judge."""
     seen = set()
     for block in context.split("\n\n---\n\n"):
@@ -153,7 +154,7 @@ def _history_candidates(history, context, split_sentences):
         title = title or "N/A"
         title_key = _comparable_words(title)
         sentences = []
-        for sentence in split_sentences(text)[:40]:
+        for sentence in split_sentences(text)[:sentence_limit]:
             words = _comparable_words(sentence)
             key = (title_key, words)
             if words and key not in seen:
@@ -167,29 +168,42 @@ def _history_candidates(history, context, split_sentences):
 def recover_history_evidence(
     provence, questions, verdicts, gaps, histories, contexts, split_sentences, *, budget,
     candidate_budget=None, use_gap=True, verifier=None, verification_mode="sentence",
+    adagate_token_budget=0, tokenizer=None,
 ):
     """Return (batch index, query, evidence block) for successful historical lookups."""
     lookups = []
     for index, verdict in enumerate(verdicts):
-        if verdict or not gaps[index] or not histories[index]:
+        if verdict or not histories[index]:
             continue
-        gap_text = _history_gap_text(gaps[index])
-        if not gap_text:
+        gap_text = _history_gap_text(gaps[index] or [])
+        if not gap_text and not adagate_token_budget:
             continue
-        candidates = _history_candidates(histories[index], contexts[index], split_sentences)
+        candidates = _history_candidates(
+            histories[index], contexts[index], split_sentences,
+            sentence_limit=None if adagate_token_budget else 40,
+        )
         if candidates:
             question = " ".join(questions[index].split())
-            query = f"{question} Missing information: {gap_text}"
+            query = f"{question} Missing information: {gap_text}" if gap_text and use_gap else question
             lookups.append((index, query, gap_text, candidates))
 
     if not lookups:
         return []
-    ranked_batch = _rank_from_sentences(
-        provence,
-        [[query if use_gap else questions[index]] for index, query, _, _ in lookups],
-        [[sentences for _, sentences in candidates] for _, _, _, candidates in lookups],
-        budget if candidate_budget is None else candidate_budget,
-    )
+    if adagate_token_budget:
+        ranked_batch = [
+            rank_history_sentences(
+                questions[index], gap if use_gap else "", contexts[index], candidates,
+                candidate_budget if candidate_budget is not None else max(12, budget),
+            )
+            for index, _, gap, candidates in lookups
+        ]
+    else:
+        ranked_batch = _rank_from_sentences(
+            provence,
+            [[query if use_gap else questions[index]] for index, query, _, _ in lookups],
+            [[sentences for _, sentences in candidates] for _, _, _, candidates in lookups],
+            budget if candidate_budget is None else candidate_budget,
+        )
     proposals = [(lookup, ranked) for lookup, ranked in zip(lookups, ranked_batch, strict=True) if ranked]
 
     decisions = [None] * len(proposals)
@@ -201,15 +215,20 @@ def recover_history_evidence(
 
     recovered = []
     for ((index, query, _, candidates), ranked), decision in zip(proposals, decisions, strict=True):
-        accepted = _accepted_history_ids(ranked, decision, budget)
-        evidence = []
-        for doc_id, locations in groupby(accepted, key=lambda item: item[0]):
-            title, sentences = candidates[doc_id]
-            evidence.append(f"[{title}] EVIDENCE:\n- " + "\n- ".join(
-                sentences[sentence_id - 1] for _, sentence_id in locations
-            ))
-        if evidence:
-            recovered.append((index, query, "\n\n---\n\n".join(evidence)))
+        accepted = []
+        for location in _accepted_history_ids(ranked, decision):
+            trial = accepted + [location]
+            if adagate_token_budget:
+                addition = _format_history_evidence(candidates, trial)
+                if contexts[index]:
+                    addition = "\n\n---\n\n" + addition
+                if len(tokenizer.encode(addition, add_special_tokens=False)) > adagate_token_budget:
+                    continue
+            accepted = trial
+            if len(accepted) == budget:
+                break
+        if accepted:
+            recovered.append((index, query, _format_history_evidence(candidates, accepted)))
     return recovered
 
 
@@ -220,9 +239,18 @@ def _verifier_candidates(documents, ranked):
     ]
 
 
-def _accepted_history_ids(ranked, decision, budget):
-    """Apply the final cap in Provence order and format the chosen IDs in source order."""
+def _accepted_history_ids(ranked, decision):
     if decision is None:
-        return sorted(ranked[:budget])
+        return ranked
     accepted = {location for number, location in enumerate(sorted(ranked), 1) if number in decision}
-    return sorted([location for location in ranked if location in accepted][:budget])
+    return [location for location in ranked if location in accepted]
+
+
+def _format_history_evidence(candidates, locations):
+    evidence = []
+    for doc_id, positions in groupby(sorted(locations), key=lambda item: item[0]):
+        title, sentences = candidates[doc_id]
+        evidence.append(f"[{title}] EVIDENCE:\n- " + "\n- ".join(
+            sentences[sentence_id - 1] for _, sentence_id in positions
+        ))
+    return "\n\n---\n\n".join(evidence)

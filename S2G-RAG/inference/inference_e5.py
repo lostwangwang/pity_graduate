@@ -842,6 +842,7 @@ def main_batch(
     history_repair_verify=False,
     history_repair_verify_mode="sentence",
     history_repair_candidate_top_k=None,
+    history_repair_adagate_token_budget=0,
 ):
     """Run one batched multi-turn RAG loop."""
     if batch_questions is None:
@@ -869,7 +870,9 @@ def main_batch(
                 verdicts[i] = False
                 missing_facts_list[i] = []
 
-        if history_docs is not None and 0 < turn < max_turns:
+        if history_docs is not None and turn > 0 and (
+            turn < max_turns or history_repair_adagate_token_budget
+        ):
             recovered = recover_history_evidence(
                 provence, batch_questions, verdicts, missing_facts_list, history_docs,
                 evidence_context_so_far, split_wiki_sentences, budget=history_repair_top_k,
@@ -877,6 +880,8 @@ def main_batch(
                 use_gap=history_repair_use_gap,
                 verifier=history_verifier,
                 verification_mode=history_repair_verify_mode,
+                adagate_token_budget=history_repair_adagate_token_budget,
+                tokenizer=gate_tokenizer,
             )
             if recovered:
                 repair_indices = [i for i, _, _ in recovered]
@@ -1069,6 +1074,7 @@ def run_system(
     history_repair_verify=False,
     history_repair_verify_mode="sentence",
     history_repair_candidate_top_k=None,
+    history_repair_adagate_token_budget=0,
 ):
     """Run the end-to-end evaluation loop."""
     data = pd.read_csv(input_file)
@@ -1114,6 +1120,7 @@ def run_system(
             provence=provence,
             history_repair_top_k=history_repair_top_k,
             history_repair_candidate_top_k=history_repair_candidate_top_k,
+            history_repair_adagate_token_budget=history_repair_adagate_token_budget,
             history_repair_use_gap=history_repair_use_gap,
             history_repair_verify=history_repair_verify,
             history_repair_verify_mode=history_repair_verify_mode,
@@ -1182,7 +1189,15 @@ def parse_args():
     parser.add_argument("--provence_model", default=PROVENCE_MODEL)
     parser.add_argument(
         "--history_repair", action="store_true",
-        help="Use Provence to recover missing evidence from earlier retrieval turns.",
+        help="Recover missing evidence from earlier retrieval turns.",
+    )
+    parser.add_argument(
+        "--history_repair_backend", choices=["provence", "adagate"], default="provence",
+        help="Rank historical sentences with Provence or AdaGATE-style utility.",
+    )
+    parser.add_argument(
+        "--history_repair_token_budget", type=int, default=160,
+        help="Maximum tokens added per AdaGATE repair, measured by the Judge tokenizer.",
     )
     parser.add_argument(
         "--history_repair_top_k", type=int, default=3,
@@ -1190,21 +1205,26 @@ def parse_args():
     )
     parser.add_argument(
         "--history_repair_candidate_top_k", type=int,
-        help="Maximum number of Provence candidates before verification. Defaults to the number of sentences added.",
+        help="Maximum candidates before verification. Defaults to top_k for Provence and max(12, top_k) for AdaGATE.",
     )
     parser.add_argument(
         "--history_repair_query", choices=["question", "question_gap"], default="question_gap",
-        help="Choose which query Provence sees during history repair.",
+        help="Use question-only or gap-aware ranking during history repair.",
     )
     parser.add_argument(
         "--history_repair_verify", action="store_true",
-        help="Check Provence candidates against the gap with the existing reasoner before adding them.",
+        help="Check historical candidates against the gap with the existing reasoner before adding them.",
     )
     parser.add_argument(
         "--history_repair_verify_mode", choices=["sentence", "joint"], default="sentence",
         help="Choose sentence-level or evidence-chain instructions for the verifier.",
     )
     args = parser.parse_args()
+    if args.history_repair_backend == "adagate":
+        if not args.history_repair:
+            parser.error("--history_repair_backend adagate requires --history_repair")
+        if args.history_repair_token_budget < 1:
+            parser.error("--history_repair_token_budget must be positive")
     if args.history_repair_verify and not args.history_repair:
         parser.error("--history_repair_verify requires --history_repair")
     if args.history_repair_verify_mode == "joint" and not args.history_repair_verify:
@@ -1326,7 +1346,9 @@ def main():
 
     tokenizer, model, gate_tokenizer, gate_model = load_reasoner_and_gate(args)
     provence = None
-    if args.evidence_selector != "s2g" or args.history_repair:
+    if args.evidence_selector != "s2g" or (
+        args.history_repair and args.history_repair_backend == "provence"
+    ):
         provence = load_provence(args.provence_model, accelerator.device)
     print(f"[INFO] Evidence selector: {args.evidence_selector}", flush=True)
 
@@ -1347,6 +1369,9 @@ def main():
         provence=provence,
         history_repair_top_k=args.history_repair_top_k if args.history_repair else 0,
         history_repair_candidate_top_k=args.history_repair_candidate_top_k,
+        history_repair_adagate_token_budget=(
+            args.history_repair_token_budget if args.history_repair_backend == "adagate" else 0
+        ),
         history_repair_use_gap=args.history_repair_query == "question_gap",
         history_repair_verify=args.history_repair_verify,
         history_repair_verify_mode=args.history_repair_verify_mode,

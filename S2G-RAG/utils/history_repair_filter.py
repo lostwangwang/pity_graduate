@@ -1,4 +1,4 @@
-"""Verify which Provence candidates provide new evidence for a Judge gap."""
+"""Verify which historical candidates provide new evidence for a Judge gap."""
 
 import json
 import logging
@@ -46,7 +46,7 @@ def verify_history_candidates(call_reasoner, requests, *, mode="sentence"):
             for i, (title, sentence) in enumerate(candidates, start=1)
         )
         tasks.append(
-            f"Question: {question}\nMissing information: {gap_text}\n"
+            f"Question: {question}\nMissing information: {gap_text or 'Unspecified. Infer the missing link from the question and current evidence.'}\n"
             f"Current evidence:\n{context}\nProposed additions:\n{numbered}"
         )
 
